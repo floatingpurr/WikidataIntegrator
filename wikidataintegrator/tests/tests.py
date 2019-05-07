@@ -3,15 +3,29 @@ import pprint
 
 import copy
 
+import requests
+
 from wikidataintegrator import wdi_core, wdi_fastrun, wdi_login
-from wikidataintegrator.wdi_core import WDBaseDataType
+from wikidataintegrator.wdi_core import WDBaseDataType, WDApiError
 
 __author__ = 'Sebastian Burgstaller-Muehlbacher'
 __license__ = 'AGPLv3'
 
 
-class TestDataType(unittest.TestCase):
+class TestMediawikiApiCall(unittest.TestCase):
+    def test_all(self):
+        with self.assertRaises(WDApiError):
+            wdi_core.WDItemEngine.mediawiki_api_call("GET", "http://www.wikidataaaaaaaaa.org",
+                                                     max_retries=3, retry_after=1,
+                                                     params={'format': 'json', 'action': 'wbgetentities', 'ids': 'Q42'})
+        with self.assertRaises(requests.HTTPError):
+            wdi_core.WDItemEngine.mediawiki_api_call("GET", "http://httpstat.us/400", max_retries=3, retry_after=1)
 
+        wdi_core.WDItemEngine.mediawiki_api_call("GET", max_retries=3, retry_after=1,
+                                                 params={'format': 'json', 'action': 'wbgetentities', 'ids': 'Q42'})
+
+
+class TestDataType(unittest.TestCase):
     def test_wd_quantity(self):
         dt = wdi_core.WDQuantity(value='34', prop_nr='P43')
 
@@ -72,7 +86,7 @@ class TestDataType(unittest.TestCase):
         if not mass_statement:
             raise
 
-        # TODO: get json directly from the API and compare part to WDItemEngine
+            # TODO: get json directly from the API and compare part to WDItemEngine
 
     def test_deletion_request(self):
         items_for_deletion = ['Q423', 'Q43345']
@@ -84,6 +98,7 @@ class TestFastRun(unittest.TestCase):
     some basic tests for fastrun mode
     
     """
+
     def test_fast_run(self):
         qid = 'Q27552312'
 
@@ -115,11 +130,11 @@ class TestFastRun(unittest.TestCase):
                                      fast_run_base_filter=fast_run_base_filter)
 
         frc = wdi_core.WDItemEngine.fast_run_store[0]
-        frc.debug=True
+        frc.debug = True
 
         assert item.get_label('en') == "Earth"
         descr = item.get_description('en')
-        assert len(descr)>3
+        assert len(descr) > 3
         aliases = item.get_aliases()
         assert "Terra" in aliases
 
@@ -153,9 +168,10 @@ class TestFastRun(unittest.TestCase):
         item.set_description("d", lang="ak")
         item.set_aliases(["a"], lang="ak", append=True)
 
+
 def test_sitelinks():
-    data = [ wdi_core.WDItemID(value='Q12136', prop_nr='P31')]
-    item = wdi_core.WDItemEngine(wd_item_id='Q622901', domain='diseases', data=data)
+    data = [wdi_core.WDItemID(value='Q12136', prop_nr='P31')]
+    item = wdi_core.WDItemEngine(wd_item_id='Q622901', data=data)
     item.get_sitelink("enwiki")
     assert "enwiki" not in item.wd_json_representation['sitelinks']
     item.set_sitelink("enwiki", "something")
@@ -166,12 +182,13 @@ def test_sitelinks():
 def test_nositelinks():
     # this item doesn't and probably wont ever have any sitelinks (but who knows?? maybe one day..)
     data = [wdi_core.WDItemID(value='Q5', prop_nr='P31')]
-    item = wdi_core.WDItemEngine(wd_item_id='Q27869338', domain=' ', data=data)
+    item = wdi_core.WDItemEngine(wd_item_id='Q27869338', data=data)
     item.get_sitelink("enwiki")
     assert "enwiki" not in item.wd_json_representation['sitelinks']
     item.set_sitelink("enwiki", "something")
     assert item.get_sitelink("enwiki")['title'] == "something"
     assert "enwiki" in item.wd_json_representation['sitelinks']
+
 
 ####
 ## tests for statement equality, with and without refs
@@ -181,7 +198,7 @@ def test_ref_equals():
     oldref = [wdi_core.WDExternalID(value='P58742', prop_nr='P352'),
               wdi_core.WDItemID(value='Q24784025', prop_nr='P527'),
               wdi_core.WDTime('+2001-12-31T12:01:13Z', prop_nr='P813')]
-    olditem = wdi_core.WDItemID("123", "P123", references=[oldref])
+    olditem = wdi_core.WDItemID("Q123", "P123", references=[oldref])
     newitem = copy.deepcopy(olditem)
     assert olditem.equals(newitem, include_ref=False)
     assert olditem.equals(newitem, include_ref=True)

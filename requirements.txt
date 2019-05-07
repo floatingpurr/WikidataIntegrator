@@ -1,6 +1,14 @@
+networkx
 simplejson
 requests
 pandas
 python-dateutil
-mwoauth
 requests_oauthlib
+tqdm
+jsonasobj
+sparql_slurper
+ShExJSG
+mwoauth
+oauthlib
+pyshexc
+pyshex

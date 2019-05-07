@@ -1,40 +1,40 @@
 import copy
 import datetime
-import itertools
 import logging
 import os
 import re
 import time
+from collections import defaultdict
+from typing import List
+import warnings
+
+import pandas as pd
 import requests
 import json
 
-import wikidataintegrator.wdi_property_store as wdi_property_store
+from pyshex import ShExEvaluator
+import pyshex
+from sparql_slurper import SlurpyGraph
+from ShExJSG import ShExC
+
 from wikidataintegrator.backoff.wdi_backoff import wdi_backoff
 from wikidataintegrator.wdi_fastrun import FastRunContainer
 from wikidataintegrator.wdi_config import config
+from wikidataintegrator.wdi_helpers import MappingRelationHelper
+from wikidataintegrator.wdi_helpers import WikibaseHelper
+
 
 """
-Authors: 
+Authors:
+  Gregory Stupp (stuppie' at 'gmail.com )
   Sebastian Burgstaller (sebastian.burgstaller' at 'gmail.com
   Andra Waagmeester (andra' at ' micelio.be)
 
-This file is part of ProteinBoxBot.
+This file is part of the WikidataIntegrator.
 
-ProteinBoxBot is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-ProteinBoxBot is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with ProteinBoxBot.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-__author__ = 'Sebastian Burgstaller, Andra Waagmeester, Gregory Stupp'
+__author__ = 'Gregory Stupp, Sebastian Burgstaller, Andra Waagmeester, '
 __license__ = 'AGPLv3'
 
 
@@ -45,28 +45,28 @@ class WDItemEngine(object):
     log_file_name = ''
     fast_run_store = []
 
+    DISTINCT_VALUE_PROPS = dict()
+
     logger = None
 
-    def __init__(self, wd_item_id='', item_name='', domain='', data=None,
+    def __init__(self, wd_item_id='', new_item=False, data=None,
                  mediawiki_api_url='https://www.wikidata.org/w/api.php',
                  sparql_endpoint_url='https://query.wikidata.org/sparql',
-                 append_value=None, use_sparql=True, fast_run=False, fast_run_base_filter=None, fast_run_use_refs=False,
+                 append_value=None, fast_run=False, fast_run_base_filter=None, fast_run_use_refs=False,
                  ref_handler=None, global_ref_mode='KEEP_GOOD', good_refs=None, keep_good_ref_statements=False,
-                 search_only=False, item_data=None, user_agent=config['USER_AGENT_DEFAULT']):
+                 search_only=False, item_data=None, user_agent=config['USER_AGENT_DEFAULT'],
+                 core_props=None, core_prop_match_thresh=0.66):
         """
         constructor
         :param wd_item_id: Wikidata item id
-        :param item_name: Label of the wikidata item
-        :param domain: The data domain the class should operate in. If None and item_name not '', create new item
-            from scratch.
-        :type domain: str or None
+        :param new_item: This parameter lets the user indicate if a new item should be created
+        :type new_item: True or False
         :param data: a dictionary with WD property strings as keys and the data which should be written to
             a WD item as the property values
+        :type data: List[WDBaseDataType]
         :param append_value: a list of properties where potential existing values should not be overwritten by the data
             passed in the :parameter data.
         :type append_value: list of property number strings
-        :param use_sparql: OBSOLETE
-        :type use_sparql: bool
         :param fast_run: True if this item should be run in fastrun mode, otherwise False. User setting this to True
             should also specify the fast_run_base_filter for these item types
         :type fast_run: bool
@@ -115,15 +115,20 @@ class WDItemEngine(object):
             conjunction with wd_item_id in order to provide raw data.
         :param user_agent: The user agent string to use when making http requests
         :type user_agent: str
+        :param core_props: Core properties are used to retrieve a Wikidata item based on `data` if a `wd_item_id` is
+            not given. This is a set of PIDs to use. If None, all Wikidata properties with a distinct values
+            constraint will be used. (see: get_core_props)
+        :param core_prop_match_thresh: The proportion of core props that must match during retrieval of an item
+            when the wd_item_id is not specified.
+        :type core_prop_match_thresh: float
         """
+        self.core_prop_match_thresh = core_prop_match_thresh
         self.wd_item_id = wd_item_id
-        self.item_name = item_name
-        self.domain = domain
+        self.new_item = new_item
         self.mediawiki_api_url = mediawiki_api_url
         self.sparql_endpoint_url = sparql_endpoint_url
         self.data = [] if data is None else data
         self.append_value = [] if append_value is None else append_value
-        self.use_sparql = use_sparql
         self.fast_run = fast_run
         self.fast_run_base_filter = fast_run_base_filter
         self.fast_run_use_refs = fast_run_use_refs
@@ -150,7 +155,17 @@ class WDItemEngine(object):
         if self.global_ref_mode == "CUSTOM" and self.ref_handler is None:
             raise ValueError("If using a custom ref mode, ref_handler must be set")
 
-        ## done setting
+        if (core_props is None) and (self.sparql_endpoint_url not in self.DISTINCT_VALUE_PROPS):
+            self.get_distinct_value_props(self.sparql_endpoint_url)
+        self.core_props = core_props if core_props is not None else self.DISTINCT_VALUE_PROPS[self.sparql_endpoint_url]
+
+        try:
+            self.mrh = MappingRelationHelper(self.sparql_endpoint_url)
+        except Exception as e:
+            # if the "equivalent property" and "mappingRelation" property are not found, we can't know what the
+            # QIDs for the mapping relation types are
+            self.mrh = None
+            warnings.warn("mapping relation types are being ignored")
 
         if self.fast_run:
             self.init_fastrun()
@@ -161,18 +176,45 @@ class WDItemEngine(object):
             elif not self.require_write and self.fast_run:
                 print('successful fastrun, no write to Wikidata required')
 
-        if self.item_name and self.domain is None and len(self.data) > 0:
+        if self.wd_item_id != '' and self.create_new_item == True:
+            raise IDMissingError('Cannot create a new item, when a wikidata identifier is given')
+        elif self.new_item == True and len(self.data) > 0:
             self.create_new_item = True
             self.__construct_claim_json()
-        elif self.item_name is '' and self.wd_item_id is '':
-            raise IDMissingError('No item name or WD identifier was given')
         elif self.wd_item_id and self.require_write:
             self.init_data_load()
         elif self.require_write:
-            # make sure that a domain is set when using data to find correct item
-            if not self.domain:
-                raise ValueError('Domain parameter has not been set')
             self.init_data_load()
+
+    @classmethod
+    def get_distinct_value_props(cls, sparql_endpoint_url='https://query.wikidata.org/sparql'):
+        """
+        On wikidata, the default core IDs will be the properties with a distinct values constraint
+        select ?p where {?p wdt:P2302 wd:Q21502410}
+        See: https://www.wikidata.org/wiki/Help:Property_constraints_portal
+        https://www.wikidata.org/wiki/Help:Property_constraints_portal/Unique_value
+        """
+        pcpid = config['PROPERTY_CONSTRAINT_PID']
+        dvcqid = config['DISTINCT_VALUES_CONSTRAINT_QID']
+        try:
+            h = WikibaseHelper(sparql_endpoint_url)
+            pcpid = h.get_pid(pcpid)
+            dvcqid = h.get_qid(dvcqid)
+        except Exception:
+            warnings.warn("Unable to determine PIDs or QIDs for retrieving distinct value properties.\n" +
+                  "Please set P2302 and Q21502410 in your wikibase or set `core_props` manually.\n" +
+                  "Continuing with no core_props")
+            cls.DISTINCT_VALUE_PROPS[sparql_endpoint_url] = set()
+            return None
+
+        query = "select ?p where {{?p wdt:{} wd:{}}}".format(pcpid, dvcqid)
+        df = cls.execute_sparql_query(query, endpoint=sparql_endpoint_url, as_dataframe=True)
+        if df.empty:
+            warnings.warn("Warning: No distinct value properties found")
+            cls.DISTINCT_VALUE_PROPS[sparql_endpoint_url] = set()
+            return None
+        df.p = df.p.str.rsplit("/", 1).str[-1]
+        cls.DISTINCT_VALUE_PROPS[sparql_endpoint_url] = set(df.p)
 
     def init_data_load(self):
         if self.wd_item_id and self.item_data:
@@ -183,12 +225,11 @@ class WDItemEngine(object):
             qids_by_props = ''
             try:
                 qids_by_props = self.__select_wd_item()
-
             except WDSearchError as e:
                 self.log('ERROR', str(e))
 
             if qids_by_props:
-                self.wd_item_id = 'Q{}'.format(qids_by_props)
+                self.wd_item_id = qids_by_props
                 self.wd_json_representation = self.get_wd_entity()
                 self.__check_integrity()
 
@@ -200,13 +241,15 @@ class WDItemEngine(object):
     def init_fastrun(self):
         for c in WDItemEngine.fast_run_store:
             if (c.base_filter == self.fast_run_base_filter) and (c.use_refs == self.fast_run_use_refs) and \
-                    (c.ref_handler == self.ref_handler) and (c.sparql_endpoint_url == self.sparql_endpoint_url):
+                    (c.sparql_endpoint_url == self.sparql_endpoint_url):
                 self.fast_run_container = c
+                self.fast_run_container.ref_handler = self.ref_handler
 
         if not self.fast_run_container:
             self.fast_run_container = FastRunContainer(base_filter=self.fast_run_base_filter,
                                                        base_data_type=WDBaseDataType, engine=self.__class__,
                                                        sparql_endpoint_url=self.sparql_endpoint_url,
+                                                       mediawiki_api_url=self.mediawiki_api_url,
                                                        use_refs=self.fast_run_use_refs,
                                                        ref_handler=self.ref_handler)
             WDItemEngine.fast_run_store.append(self.fast_run_container)
@@ -233,10 +276,8 @@ class WDItemEngine(object):
         headers = {
             'User-Agent': self.user_agent
         }
-
-        reply = requests.get(self.mediawiki_api_url, params=params, headers=headers)
-        reply.raise_for_status()
-        return self.parse_wd_json(wd_json=reply.json()['entities'][self.wd_item_id])
+        json_data = self.mediawiki_api_call("GET", self.mediawiki_api_url, params=params, headers=headers)
+        return self.parse_wd_json(wd_json=json_data['entities'][self.wd_item_id])
 
     def parse_wd_json(self, wd_json):
         """
@@ -337,60 +378,55 @@ class WDItemEngine(object):
         The most likely WD item QID should be returned, after querying WDQ for all values in core_id properties
         :return: Either a single WD QID is returned, or an empty string if no suitable item in WD
         """
-        qid_list = []
+        qid_list = set()
         conflict_source = {}
+        if self.mrh:
+            exact_qid = self.mrh.mrt_qids['http://www.w3.org/2004/02/skos/core#exactMatch']
+            mrt_pid = self.mrh.mrt_pid
+        else:
+            # This is a `hack` for if initializing the mapping relation helper fails. We can't determine the
+            # mapping relation type PID or the exact match QID. If we set mrt_pid to "Pxxx", then no qualifier will
+            # ever match it (and exact_qid will never get checked), and so what happens is exactly what would
+            # happen if the statement had no mapping relation qualifiers
+            exact_qid = "Q0"
+            mrt_pid = "PXXX"
+
         for statement in self.data:
             wd_property = statement.get_prop_nr()
+
+            # only use this statement if mapping relation type is exact, or mrt is not specified
+            mrt_qualifiers = [q for q in statement.get_qualifiers() if q.get_prop_nr() == mrt_pid]
+            if (len(mrt_qualifiers) == 1) and (mrt_qualifiers[0].get_value() != int(exact_qid[1:])):
+                continue
 
             # TODO: implement special treatment when searching for date/coordinate values
             data_point = statement.get_value()
             if isinstance(data_point, tuple):
                 data_point = data_point[0]
 
-            if wd_property in wdi_property_store.wd_properties:
-                # check if the property is a core_id and should be unique for every WD item
-                assert all(isinstance(v['core_id'], bool) for k, v in wdi_property_store.wd_properties.items()), \
-                    "wd_properties 'core_id' must be a bool"
-                if wdi_property_store.wd_properties[wd_property]['core_id'] is True:
-                    tmp_qids = []
+            core_props = self.core_props
+            if wd_property in core_props:
+                tmp_qids = set()
+                # if mrt_pid is "PXXX", this is fine, because the part of the SPARQL query using it is optional
+                query = statement.sparql_query.format(mrt_pid=mrt_pid, pid=wd_property, value=data_point)
+                results = WDItemEngine.execute_sparql_query(query=query, endpoint=self.sparql_endpoint_url)
 
-                    if not self.use_sparql:
-                        url = 'http://wdq.wmflabs.org/api'
-                        params = {
-                            'q': u'string[{}:{}]'.format(str(wd_property).replace('P', ''),
-                                                         u'"{}"'.format(data_point)),
-                        }
-                        headers = {
-                            'User-Agent': self.user_agent
-                        }
+                for i in results['results']['bindings']:
+                    qid = i['item_id']['value'].split('/')[-1]
+                    if ('mrt' not in i) or ('mrt' in i and i['mrt']['value'].split('/')[-1] == exact_qid):
+                        tmp_qids.add(qid)
 
-                        reply = requests.get(url, params=params, headers=headers)
-                        reply.raise_for_status()
+                qid_list.update(tmp_qids)
 
-                        tmp_qids = reply.json()['items']
-                    else:
-                        query = statement.sparql_query.format(wd_property, data_point)
-                        results = WDItemEngine.execute_sparql_query(query=query, endpoint=self.sparql_endpoint_url)
+                # Protocol in what property the conflict arises
+                if wd_property in conflict_source:
+                    conflict_source[wd_property].append(tmp_qids)
+                else:
+                    conflict_source[wd_property] = [tmp_qids]
 
-                        for i in results['results']['bindings']:
-                            qid = i['item_id']['value'].split('/')[-1]
-                            # remove 'Q' prefix
-                            qid = qid[1:]
-                            tmp_qids.append(qid)
-
-                    qid_list.append(tmp_qids)
-
-                    # Protocol in what property the conflict arises
-                    if wd_property in conflict_source:
-                        conflict_source[wd_property].append(tmp_qids)
-                    else:
-                        conflict_source[wd_property] = [tmp_qids]
-
-                    if len(tmp_qids) > 1:
-                        raise ManualInterventionReqException(
-                            'More than one WD item has the same property value', wd_property, tmp_qids)
-
-        qid_list = [i for i in itertools.chain.from_iterable(qid_list)]
+                if len(tmp_qids) > 1:
+                    raise ManualInterventionReqException(
+                        'More than one WD item has the same property value', wd_property, tmp_qids)
 
         if len(qid_list) == 0:
             self.create_new_item = True
@@ -647,50 +683,48 @@ class WDItemEngine(object):
         of a certain domain.
         :return: boolean True if test passed
         """
-        # generate a set containing all property number of the item currently loaded
-        assert all(isinstance(v['core_id'], bool) for k, v in wdi_property_store.wd_properties.items()), \
-            "wd_properties 'core_id' must be a bool"
-        core_props_list = set([x.get_prop_nr() for x in self.statements if
-                               x.get_prop_nr() in wdi_property_store.wd_properties and
-                               wdi_property_store.wd_properties[x.get_prop_nr()]['core_id'] is True])
+        # all core props
+        wdi_core_props = self.core_props
+        # core prop statements that exist on the item
+        cp_statements = [x for x in self.statements if x.get_prop_nr() in wdi_core_props]
+        item_core_props = set(x.get_prop_nr() for x in cp_statements)
+        # core prop statements we are loading
+        cp_data = [x for x in self.data if x.get_prop_nr() in wdi_core_props]
 
         # compare the claim values of the currently loaded QIDs to the data provided in self.data
-        count_existing_ids = 0
-        for i in self.data:
-            prop_nr = i.get_prop_nr()
-            if prop_nr in core_props_list:
-                count_existing_ids += 1
-
-        match_count_per_prop = dict()
-        for new_stat in self.data:
-            for stat in self.statements:
-                pn = new_stat.get_prop_nr()
-                if new_stat == stat and pn in core_props_list:
-                    if pn in match_count_per_prop:
-                        match_count_per_prop[pn] += 1
-                    else:
-                        match_count_per_prop[pn] = 1
+        # this is the number of core_ids in self.data that are also on the item
+        count_existing_ids = len([x for x in self.data if x.get_prop_nr() in item_core_props])
 
         core_prop_match_count = 0
-        for x in match_count_per_prop:
-            core_prop_match_count += match_count_per_prop[x]
+        for new_stat in self.data:
+            for stat in self.statements:
+                if (new_stat.get_prop_nr() == stat.get_prop_nr()) and (new_stat.get_value() == stat.get_value()) \
+                        and (new_stat.get_prop_nr() in item_core_props):
+                    core_prop_match_count += 1
 
-        data_kv_pairs = ['{}:{}'.format(x.get_prop_nr(), x.get_value()) for x in self.data]
-        statements_kv_pairs = ['{}:{}'.format(x.get_prop_nr(), x.get_value()) for x in self.statements]
-
-        if core_prop_match_count < count_existing_ids * 0.66:
-            raise ManualInterventionReqException('Retrieved item ({}) does not match provided core IDs. '
-                                                 'Matching count {}, non-matching count {}'
-                                                 .format(self.wd_item_id, core_prop_match_count,
-                                                         count_existing_ids - core_prop_match_count),
-                                                 'data Key values: {}'.format(data_kv_pairs),
-                                                 'statement Key values: {}'.format(statements_kv_pairs))
+        if core_prop_match_count < count_existing_ids * self.core_prop_match_thresh:
+            existing_core_pv = defaultdict(set)
+            for s in cp_statements:
+                existing_core_pv[s.get_prop_nr()].add(s.get_value())
+            new_core_pv = defaultdict(set)
+            for s in cp_data:
+                new_core_pv[s.get_prop_nr()].add(s.get_value())
+            nomatch_existing = {k: v - new_core_pv[k] for k, v in existing_core_pv.items()}
+            nomatch_existing = {k: v for k, v in nomatch_existing.items() if v}
+            nomatch_new = {k: v - existing_core_pv[k] for k, v in new_core_pv.items()}
+            nomatch_new = {k: v for k, v in nomatch_new.items() if v}
+            raise CorePropIntegrityException('Retrieved item ({}) does not match provided core IDs. '
+                                             'Matching count {}, non-matching count {}. '
+                                             .format(self.wd_item_id, core_prop_match_count,
+                                                     count_existing_ids - core_prop_match_count) +
+                                             'existing unmatched core props: {}. '.format(nomatch_existing) +
+                                             'statement unmatched core props: {}.'.format(nomatch_new))
         else:
             return True
 
     def get_label(self, lang='en'):
         """
-        Retrurns the label for a certain language
+        Returns the label for a certain language
         :param lang:
         :type lang: str
         :return: returns the label in the specified language, an empty string if the label does not exist
@@ -846,30 +880,35 @@ class WDItemEngine(object):
         else:
             return None
 
-    def write(self, login, bot_account=True, edit_summary='', entity_type='item', property_datatype='string'):
+    def write(self, login, bot_account=True, edit_summary='', entity_type='item', property_datatype='string',
+              max_retries=10, retry_after=30):
         """
         Writes the WD item Json to WD and after successful write, updates the object with new ids and hashes generated
         by WD. For new items, also returns the new QIDs.
         :param login: a instance of the class PBB_login which provides edit-cookies and edit-tokens
-        :type login:
         :param bot_account: Tell the Wikidata API whether the script should be run as part of a bot account or not.
         :type bot_account: bool
         :param edit_summary: A short (max 250 characters) summary of the purpose of the edit. This will be displayed as
             the revision summary of the Wikidata item.
-        :param entity_type: Decides wether the object will become an item (default) or a property (with 'property')
-        :param property_datatype: When payload_type is 'property' then this parameter set the datatype for the property
         :type edit_summary: str
+        :param entity_type: Decides wether the object will become an item (default) or a property (with 'property')
+        :type entity_type: str
+        :param property_datatype: When payload_type is 'property' then this parameter set the datatype for the property
+        :type property_datatype: str
+        :param max_retries: If api request fails due to rate limiting, maxlag, or readonly mode, retry up to
+        `max_retries` times
+        :type max_retries: int
+        :param retry_after: Number of seconds to wait before retrying request (see max_retries)
+        :type retry_after: int
         :return: the WD QID on sucessful write
         """
         if not self.require_write:
             return self.wd_item_id
 
-        headers = {
-            'content-type': 'application/x-www-form-urlencoded',
-            'charset': 'utf-8'
-        }
         if entity_type == 'property':
             self.wd_json_representation['datatype'] = property_datatype
+            if 'sitelinks' in self.wd_json_representation:
+                del self.wd_json_representation['sitelinks']
 
         payload = {
             'action': 'wbeditentity',
@@ -878,6 +917,10 @@ class WDItemEngine(object):
             'token': login.get_edit_token(),
             'summary': edit_summary,
             'maxlag': config['MAXLAG']
+        }
+        headers = {
+            'content-type': 'application/x-www-form-urlencoded',
+            'charset': 'utf-8'
         }
 
         if bot_account:
@@ -888,54 +931,102 @@ class WDItemEngine(object):
         else:
             payload.update({u'id': self.wd_item_id})
 
-        url = self.mediawiki_api_url
-        lastrevid = None
-
         try:
-            reply = login.get_session().post(url, headers=headers, data=payload)
+            json_data = self.mediawiki_api_call('POST', self.mediawiki_api_url, session=login.get_session(),
+                                                max_retries=max_retries, retry_after=retry_after,
+                                                headers=headers, data=payload)
 
-            # if the server does not reply with a string which can be parsed into a json, an error will be raised.
-            json_data = reply.json()
-
-            # pprint.pprint(json_data)
-            if "success" in json_data and "entity" in json_data and "lastrevid" in json_data["entity"]:
-                lastrevid = json_data["entity"]["lastrevid"]
-
-            # deal with maxlag
-            if 'error' in json_data.keys() and 'code' in json_data['error'] \
-                    and json_data['error']['code'] == 'maxlag':
-                lag = json_data['error']['lag']
-                time.sleep(lag)
-                del payload['maxlag']
-                reply = login.get_session().post(url, headers=headers, data=payload)
-                json_data = reply.json()
-
-            if 'error' in json_data.keys() and 'code' in json_data['error'] \
-                    and json_data['error']['code'] == 'readonly':
-                print('Wikidata currently is in readonly mode, waiting for 60 seconds')
-                time.sleep(60)
-                return self.write(login=login)
-
-            if 'error' in json_data.keys() and 'messages' in json_data['error']:
-                if 'wikibase-validator-label-with-description-conflict' == json_data['error']['messages'][0]['name']:
+            if 'error' in json_data and 'messages' in json_data['error']:
+                error_msg_names = set(x.get('name') for x in json_data["error"]['messages'])
+                if 'wikibase-validator-label-with-description-conflict' in error_msg_names:
                     raise NonUniqueLabelDescriptionPairError(json_data)
                 else:
                     raise WDApiError(json_data)
             elif 'error' in json_data.keys():
                 raise WDApiError(json_data)
-
-        except Exception as e:
+        except Exception:
             print('Error while writing to Wikidata')
-            raise e
+            raise
 
         # after successful write, update this object with latest json, QID and parsed data types.
         self.create_new_item = False
         self.wd_item_id = json_data['entity']['id']
         self.parse_wd_json(wd_json=json_data['entity'])
         self.data = []
-        self.lastrevid = lastrevid
+        if "success" in json_data and "entity" in json_data and "lastrevid" in json_data["entity"]:
+            self.lastrevid = json_data["entity"]["lastrevid"]
 
         return self.wd_item_id
+
+    @staticmethod
+    def mediawiki_api_call(method, mediawiki_api_url='https://www.wikidata.org/w/api.php',
+                           session=None, max_retries=10, retry_after=30, **kwargs):
+        """
+        :param method: 'GET' or 'POST'
+        :param mediawiki_api_url:
+        :param session: If a session is passed, it will be used. Otherwise a new requests session is created
+        :param max_retries: If api request fails due to rate limiting, maxlag, or readonly mode, retry up to
+        `max_retries` times
+        :type max_retries: int
+        :param retry_after: Number of seconds to wait before retrying request (see max_retries)
+        :type retry_after: int
+        :param kwargs: Passed to requests.request
+        :return:
+        """
+        response = None
+        session = session if session else requests.session()
+        for n in range(max_retries):
+            try:
+                response = session.request(method, mediawiki_api_url, **kwargs)
+            except requests.exceptions.ConnectionError as e:
+                print("Connection error: {}. Sleeping for {} seconds.".format(e, retry_after))
+                time.sleep(retry_after)
+                continue
+            if response.status_code == 503:
+                print("service unavailable. sleeping for {} seconds".format(retry_after))
+                time.sleep(retry_after)
+                continue
+
+            response.raise_for_status()
+            json_data = response.json()
+            """
+            wikidata api response has code = 200 even if there are errors.
+            rate limit doesn't return HTTP 429 either. may in the future
+            https://phabricator.wikimedia.org/T172293
+            """
+            if 'error' in json_data:
+                # rate limiting
+                error_msg_names = set()
+                if 'messages' in json_data['error']:
+                    error_msg_names = set(x.get('name') for x in json_data["error"]['messages'])
+                if 'actionthrottledtext' in error_msg_names:
+                    sleep_sec = int(response.headers.get('retry-after', retry_after))
+                    print("{}: rate limited. sleeping for {} seconds".format(datetime.datetime.utcnow(), sleep_sec))
+                    time.sleep(sleep_sec)
+                    continue
+
+                # maxlag
+                if 'code' in json_data['error'] and json_data['error']['code'] == 'maxlag':
+                    sleep_sec = json_data['error'].get('lag', retry_after)
+                    print("{}: maxlag. sleeping for {} seconds".format(datetime.datetime.utcnow(), sleep_sec))
+                    time.sleep(sleep_sec)
+                    continue
+
+                # readonly
+                if 'code' in json_data['error'] and json_data['error']['code'] == 'readonly':
+                    print('Wikidata currently is in readonly mode, waiting for {} seconds'.format(retry_after))
+                    time.sleep(retry_after)
+                    continue
+
+            # there is no error or waiting. break out of this loop and parse response
+            break
+        else:
+            # the first time I've ever used for - else!!
+            # else executes if the for loop completes normally. i.e. does not encouter a `break`
+            # in this case, that means it tried this api call 10 times
+            raise WDApiError(response.json() if response else dict())
+
+        return json_data
 
     @classmethod
     def setup_logging(cls, log_dir="./logs", log_name=None, header=None, names=None,
@@ -1054,13 +1145,14 @@ class WDItemEngine(object):
     @staticmethod
     @wdi_backoff()
     def execute_sparql_query(query, prefix=None, endpoint='https://query.wikidata.org/sparql',
-                             user_agent=config['USER_AGENT_DEFAULT']):
+                             user_agent=config['USER_AGENT_DEFAULT'], as_dataframe=False):
         """
         Static method which can be used to execute any SPARQL query
         :param prefix: The URI prefixes required for an endpoint, default is the Wikidata specific prefixes
         :param query: The actual SPARQL query string
         :param endpoint: The URL string for the SPARQL endpoint. Default is the URL for the Wikidata SPARQL endpoint
         :param user_agent: Set a user agent string for the HTTP header to let the WDQS know who you are.
+        :param as_dataframe: Return result as pandas dataframe
         :type user_agent: str
         :return: The results of the query are returned in JSON format
         """
@@ -1082,13 +1174,93 @@ class WDItemEngine(object):
         }
         response = requests.get(endpoint, params=params, headers=headers)
         response.raise_for_status()
+        results = response.json()
 
-        return response.json()
+        if as_dataframe:
+            return WDItemEngine._sparql_query_result_to_df(results)
+        else:
+            return results
+
+    @staticmethod
+    def _sparql_query_result_to_df(results):
+
+        def parse_value(item):
+            if item.get("datatype") == "http://www.w3.org/2001/XMLSchema#decimal":
+                return float(item['value'])
+            if item.get("datatype") == "http://www.w3.org/2001/XMLSchema#integer":
+                return int(item['value'])
+            if item.get("datatype") == "http://www.w3.org/2001/XMLSchema#dateTime":
+                return datetime.datetime.strptime(item['value'], '%Y-%m-%dT%H:%M:%SZ')
+            return item['value']
+
+        results = results['results']['bindings']
+        results = [{k: parse_value(v) for k, v in item.items()} for item in results]
+        df = pd.DataFrame(results)
+        return df
+
+
+
+    @staticmethod
+    def check_shex_conformance(qid, schema, endpoint="https://query.wikidata.org/sparql", debug=False, output="confirm"):
+        results = dict()
+        results["wdid"] = qid
+        slurpeddata = SlurpyGraph(endpoint)
+        for p, o in slurpeddata.predicate_objects(qid):
+            pass
+
+        for result in ShExEvaluator(rdf=slurpeddata, schema=schema, focus=qid).evaluate():
+            shex_result = dict()
+            if result.result:
+                shex_result["result"] = True
+            else:
+                shex_result["result"] = False
+            shex_result["reason"] = result.reason
+            shex_result["focus"] = result.focus
+
+        if output == "confirm":
+            return shex_result["result"]
+        elif output == "reason":
+            return shex_result["reason"]
+        else:
+            return shex_result
+
+    @staticmethod
+    def run_shex_manifest(manifest_url, index=0, debug=False):
+        """
+        :param manifest: A url to a manifest that contains all the ingredients to run a shex conformance test
+        :param index: Manifests are stored in lists. This method only handles one manifest, hence by default the first
+               manifest is going to be selected
+        :return:
+        """
+        manifest = json.loads(manifest_url, debug=False)
+        manifest_results = dict()
+        for case in manifest[index]:
+            if case.data.startswith("Endpoint:"):
+                sparql_endpoint = case.data.replace("Endpoint: ", "")
+                schema = requests.get(case.schemaURL).text
+                shex = ShExC(schema).schema
+                evaluator = ShExEvaluator(schema=shex, debug=debug)
+                sparql_query = case.queryMap.replace("SPARQL '''", "").replace("'''@START", "")
+
+                df = WDItemEngine.execute_sparql_query(sparql_query)
+                for row in df["results"]["bindings"]:
+                    wdid = row["item"]["value"]
+                    if wdid not in  manifest_results.keys():
+                        manifest_results[wdid] = dict()
+                    slurpeddata = SlurpyGraph(sparql_endpoint)
+                    results = evaluator.evaluate(rdf=slurpeddata, focus=wdid, debug=debug)
+                    for result in results:
+                        if result.result:
+                            manifest_results[wdid]["status"] = "CONFORMS"
+                        else:
+                            manifest_results[wdid]["status"] = "DOES NOT CONFORM"
+                            manifest_results[wdid]["debug"] = result.reason
+        return manifest_results
+
 
     @staticmethod
     def merge_items(from_id, to_id, login_obj, mediawiki_api_url='https://www.wikidata.org/w/api.php',
-                    ignore_conflicts='',
-                    user_agent=config['USER_AGENT_DEFAULT']):
+                    ignore_conflicts='', user_agent=config['USER_AGENT_DEFAULT']):
         """
         A static method to merge two Wikidata items
         :param from_id: The QID which should be merged into another item
@@ -1315,10 +1487,21 @@ class WDBaseDataType(object):
     The base class for all Wikidata data types, they inherit from it
     """
 
+    # example sparql query
+    """
+    SELECT * WHERE {
+      ?item_id p:P492 ?s .
+      ?s ps:P492 '614212' .
+      OPTIONAL {?s pq:P4390 ?mrt}
+    }
+    """
+
     sparql_query = '''
-        SELECT * WHERE {{
-            ?item_id p:{0}/ps:{0} '{1}' .
-        }}
+    SELECT * WHERE {{
+      ?item_id p:{pid} ?s .
+      ?s ps:{pid} '{value}' .
+      OPTIONAL {{?s pq:{mrt_pid} ?mrt}}
+    }}
     '''
 
     def __init__(self, value, snak_type, data_type, is_reference, is_qualifier, references, qualifiers, rank, prop_nr,
@@ -1467,7 +1650,9 @@ class WDBaseDataType(object):
         return self.value
 
     def set_value(self, value):
-        if value is None or (self.snak_type == 'novalue' or self.snak_type == 'somevalue'):
+        if value is None and self.snak_type not in {'novalue', 'somevalue'}:
+            raise ValueError("If 'value' is None, snak_type must be novalue or somevalue")
+        if self.snak_type in {'novalue', 'somevalue'}:
             del self.json_representation['datavalue']
         elif 'datavalue' not in self.json_representation:
             self.json_representation['datavalue'] = {}
@@ -1681,6 +1866,7 @@ class WDString(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.value = value
 
         self.json_representation['datavalue'] = {
@@ -1733,6 +1919,7 @@ class WDMath(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.value = value
 
         self.json_representation['datavalue'] = {
@@ -1786,6 +1973,7 @@ class WDExternalID(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.value = value
 
         self.json_representation['datavalue'] = {
@@ -1810,7 +1998,9 @@ class WDItemID(WDBaseDataType):
     DTYPE = 'wikibase-item'
     sparql_query = '''
         SELECT * WHERE {{
-            ?item_id p:{0}/ps:{0} wd:Q{1} .
+          ?item_id p:{pid} ?s .
+          ?s ps:{pid} wd:Q{value} .
+          OPTIONAL {{?s pq:{mrt_pid} ?mrt}}
         }}
     '''
 
@@ -1844,11 +2034,13 @@ class WDItemID(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
+        assert isinstance(value, (str, int)) or value is None, \
+            "Expected str or int, found {} ({})".format(type(value), value)
         if value is None:
-            self.value = None
-        elif type(value) == int:
             self.value = value
-        elif value[0] == 'Q':
+        elif isinstance(value, int):
+            self.value = value
+        elif value.startswith("Q"):
             pattern = re.compile('[0-9]*')
             matches = pattern.match(value[1:])
 
@@ -1856,6 +2048,8 @@ class WDItemID(WDBaseDataType):
                 self.value = int(value[1:])
             else:
                 raise ValueError('Invalid WD item ID, format must be "Q[0-9]*"')
+        else:
+            raise ValueError('Invalid WD item ID, format must be "Q[0-9]*"')
 
         self.json_representation['datavalue'] = {
             'value': {
@@ -1883,7 +2077,9 @@ class WDProperty(WDBaseDataType):
     DTYPE = 'wikibase-property'
     sparql_query = '''
         SELECT * WHERE {{
-            ?item_id p:{0}/ps:{0} wd:P{1} .
+          ?item_id p:{pid} ?s .
+          ?s ps:{pid} wd:P{value} .
+          OPTIONAL {{?s pq:{mrt_pid} ?mrt}}
         }}
     '''
 
@@ -1917,12 +2113,13 @@ class WDProperty(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
-        # check if WD item or property ID is in valid format
+        assert isinstance(value, (str, int)) or value is None, \
+            "Expected str or int, found {} ({})".format(type(value), value)
         if value is None:
-            self.value = None
-        elif type(value) == int:
             self.value = value
-        elif value[0] == 'P':
+        elif isinstance(value, int):
+            self.value = value
+        elif value.startswith("P"):
             pattern = re.compile('[0-9]*')
             matches = pattern.match(value[1:])
 
@@ -1930,6 +2127,8 @@ class WDProperty(WDBaseDataType):
                 self.value = int(value[1:])
             else:
                 raise ValueError('Invalid WD property ID, format must be "P[0-9]*"')
+        else:
+            raise ValueError('Invalid WD property ID, format must be "P[0-9]*"')
 
         self.json_representation['datavalue'] = {
             'value': {
@@ -2010,19 +2209,13 @@ class WDTime(WDBaseDataType):
         super(WDTime, self).set_value(value=self.time)
 
         if self.time is not None:
+            assert isinstance(self.time, str), \
+                "WDTime time must be a string in the following format: '+%Y-%m-%dT%H:%M:%SZ'"
             if self.precision < 0 or self.precision > 14:
                 raise ValueError('Invalid value for time precision, '
                                  'see https://www.mediawiki.org/wiki/Wikibase/DataModel/JSON#time')
             if not (self.time.startswith("+") or self.time.startswith("-")):
                 self.time = "+" + self.time
-            try:
-                if self.time[6:8] != '00' and self.time[9:11] != '00':
-                    if self.time.startswith('-'):
-                        datetime.datetime.strptime(self.time, '-%Y-%m-%dT%H:%M:%SZ')
-                    else:
-                        datetime.datetime.strptime(self.time, '+%Y-%m-%dT%H:%M:%SZ')
-            except ValueError as e:
-                raise ValueError('Wrong data format, date format must be +%Y-%m-%dT%H:%M:%SZ or -%Y-%m-%dT%H:%M:%SZ')
 
     @classmethod
     @JsonParser
@@ -2040,11 +2233,6 @@ class WDUrl(WDBaseDataType):
     Implements the Wikidata data type for URL strings
     """
     DTYPE = 'url'
-    sparql_query = '''
-        SELECT * WHERE {{
-            ?item_id p:{0}/ps:{0} <{1}> .
-        }}
-    '''
 
     def __init__(self, value, prop_nr, is_reference=False, is_qualifier=False, snak_type='value', references=None,
                  qualifiers=None, rank='normal', check_qualifier_equality=True):
@@ -2141,15 +2329,17 @@ class WDMonolingualText(WDBaseDataType):
         self.set_value(value)
 
     def set_value(self, value):
+        value = value[0]
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.json_representation['datavalue'] = {
             'value': {
-                'text': value[0],
+                'text': value,
                 'language': self.language
             },
             'type': 'monolingualtext'
         }
 
-        super(WDMonolingualText, self).set_value(value=value[0])
+        super(WDMonolingualText, self).set_value(value=value)
 
     @classmethod
     @JsonParser
@@ -2304,6 +2494,7 @@ class WDCommonsMedia(WDBaseDataType):
         self.set_value(value)
 
     def set_value(self, value):
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.json_representation['datavalue'] = {
             'value': value,
             'type': 'string'
@@ -2430,6 +2621,7 @@ class WDGeoShape(WDBaseDataType):
         self.set_value(value=value)
 
     def set_value(self, value):
+        assert isinstance(value, str) or value is None, "Expected str, found {} ({})".format(type(value), value)
         self.value = value
 
         self.json_representation['datavalue'] = {
@@ -2511,6 +2703,14 @@ class WDSearchError(Exception):
 class ManualInterventionReqException(Exception):
     def __init__(self, value, property_string, item_list):
         self.value = value + ' Property: {}, items affected: {}'.format(property_string, item_list)
+
+    def __str__(self):
+        return repr(self.value)
+
+
+class CorePropIntegrityException(Exception):
+    def __init__(self, value):
+        self.value = value
 
     def __str__(self):
         return repr(self.value)

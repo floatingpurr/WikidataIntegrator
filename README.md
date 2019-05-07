@@ -1,5 +1,8 @@
 # Wikidata Integrator #
 [![Build Status](https://travis-ci.org/SuLab/WikidataIntegrator.svg?branch=master)](https://travis-ci.org/SuLab/WikidataIntegrator)
+[![Pyversions](https://img.shields.io/pypi/pyversions/wikidataintegrator.svg)](https://pypi.python.org/pypi/wikidataintegrator)
+[![PyPi](https://img.shields.io/pypi/v/wikidataintegrator.svg)](https://pypi.python.org/pypi/wikidataintegrator)
+
 # Installation #
 The easiest way to install WikidataIntegrator is using `pip`
 ```
@@ -165,6 +168,21 @@ The class wdi_core.wdi_helpers.PubmedItem allows you to create article items. Gi
 The class wdi_core.wdi_helpers.Release allows you to create an item for a database release. These should be used in reference statements. See [here](https://www.wikidata.org/wiki/User:ProteinBoxBot/evidence#Guidelines_for_Referencing_Databases.2C_Ontologies_and_similar_Web-native_information_entities.) 
 for more information. 
 
+## Test for conformance to a Shape Expression ##
+Shape Expressions (ShEx) is a structural schema language for RDF graphs. It allows to express the graph structures such a Wikidata items. 
+The class wdi_core.check_shex_conformance tests a wikidata item on conformance to a given ShEx.
+In the example below two wikidata items on human diseases (Q18556942 and Q6949365)  are checked for conformance to a disease schema expressed as shape expressions. 
+
+
+```Python
+from wikidataintegrator import wdi_core
+import requests
+
+shex = requests.get("https://raw.githubusercontent.com/SuLab/Genewiki-ShEx/master/diseases/wikidata-disease-ontology.shex").text
+print("wd:Q18556942", wdi_core.WDItemEngine.check_shex_conformance(item_iri="http://www.wikidata.org/entity/Q18556942", shex=shex)) # Returns True
+print("wd:Q6949365", wdi_core.WDItemEngine.check_shex_conformance(item_iri="http://www.wikidata.org/entity/Q6949365", shex=shex)) # Returns False
+```
+
 # Examples (in normal mode) #
 
 ## An Example Bot ##
@@ -191,7 +209,7 @@ In order to create a minimal bot based on wdi_core, three things are required:
     data = [entrez_gene_id]
     
     # Search for and then edit/create new item
-    wd_item = wdi_core.WDItemEngine(item_name='<your_item_name>', domain='genes', data=[entrez_gene_id])
+    wd_item = wdi_core.WDItemEngine(data=[entrez_gene_id])
     wd_item.write(login_instance)
 ```
 
@@ -220,7 +238,7 @@ An enhanced example of the previous bot just puts two of the three things into a
         data = [entrez_gene_id, ensembl_transcript_id]
         
         # Search for and then edit/create new item
-        wd_item = wdi_core.WDItemEngine(item_name='<your_item_name>', domain='genes', data=data)
+        wd_item = wdi_core.WDItemEngine(data=data)
         wd_item.write(login_instance)
 ```
 
@@ -266,7 +284,7 @@ The full example:
         data = [entrez_gene_id, ensembl_transcript_id]
         
         # Search for and then edit/create new item
-        wd_item = wdi_core.WDItemEngine(item_name='<your_item_name>', domain='genes', data=data, fast_run=fast_run, fast_run_base_filter=fast_run_base_filter)
+        wd_item = wdi_core.WDItemEngine(data=data, fast_run=fast_run, fast_run_base_filter=fast_run_base_filter)
         wd_item.write(login_instance)
 ```
 

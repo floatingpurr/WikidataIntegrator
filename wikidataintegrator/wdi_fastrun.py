@@ -1,10 +1,7 @@
 import copy
 from collections import defaultdict
-from datetime import datetime
+from functools import lru_cache
 from itertools import chain
-
-__author__ = 'Sebastian Burgstaller-Muehlbacher'
-__license__ = 'AGPLv3'
 
 example_Q14911732 = {'P1057':
                          {'Q14911732-23F268EB-2848-4A82-A248-CF4DF6B256BC':
@@ -18,7 +15,8 @@ example_Q14911732 = {'P1057':
 
 
 class FastRunContainer(object):
-    def __init__(self, base_data_type, engine, sparql_endpoint_url=None, base_filter=None, use_refs=False, ref_handler=None):
+    def __init__(self, base_data_type, engine, sparql_endpoint_url=None, mediawiki_api_url=None,
+                 base_filter=None, use_refs=False, ref_handler=None):
         self.prop_data = {}
         self.loaded_langs = {}
         self.statements = []
@@ -29,7 +27,10 @@ class FastRunContainer(object):
         self.rev_lookup = defaultdict(set)
         self.base_data_type = base_data_type
         self.engine = engine
-        self.sparql_endpoint_url = sparql_endpoint_url if sparql_endpoint_url else getattr(engine, 'sparql_endpoint_url', None)
+        self.sparql_endpoint_url = sparql_endpoint_url if sparql_endpoint_url else \
+            'https://query.wikidata.org/sparql'
+        self.mediawiki_api_url = mediawiki_api_url if mediawiki_api_url else \
+            'https://www.wikidata.org/w/api.php'
         self.debug = False
         self.reconstructed_statements = []
         self.use_refs = use_refs
@@ -56,8 +57,7 @@ class FastRunContainer(object):
             props = q_props | r_props
             for prop in props:
                 if prop not in self.prop_dt_map:
-                    self.prop_dt_map.update({prop: FastRunContainer.get_prop_datatype(prop_nr=prop,
-                                                                                      engine=self.engine)})
+                    self.prop_dt_map.update({prop: self.get_prop_datatype(prop)})
             # reconstruct statements from frc (including qualifiers, and refs)
             for uid, d in dt.items():
                 qualifiers = []
@@ -106,8 +106,7 @@ class FastRunContainer(object):
 
             if prop_nr not in self.prop_dt_map:
                 print("{} not found in fastrun".format(prop_nr))
-                self.prop_dt_map.update({prop_nr: FastRunContainer.get_prop_datatype(prop_nr=prop_nr,
-                                                                                     engine=self.engine)})
+                self.prop_dt_map.update({prop_nr: self.get_prop_datatype(prop_nr)})
                 self._query_data(prop_nr)
 
             # more sophisticated data types like dates and globe coordinates need special treatment here
@@ -298,15 +297,39 @@ class FastRunContainer(object):
         return self.prop_data
 
     def format_query_results(self, r, prop_nr):
-        # r is the results of the sparql query in _query_data
-        # r is modified in place
-        # prop_nr is needed to get the property datatype to determine how to format the value
-        prop_dt = FastRunContainer.get_prop_datatype(prop_nr=prop_nr, engine=self.engine)
+        """
+        `r` is the results of the sparql query in _query_data and is modified in place
+        `prop_nr` is needed to get the property datatype to determine how to format the value
+
+        `r` is a list of dicts. The keys are:
+            item: the subject. the item this statement is on
+            v: the object. The value for this statement
+            sid: statement ID
+            pq: qualifier property
+            qval: qualifier value
+            ref: reference ID
+            pr: reference property
+            rval: reference value
+        """
+        prop_dt = self.get_prop_datatype(prop_nr)
         for i in r:
-            for value in {'item', 'sid', 'qval', 'pq', 'pr', 'ref'}:
+            for value in {'item', 'sid', 'pq', 'pr', 'ref'}:
                 if value in i:
+                    # these are always URIs for the local wikibase
                     i[value] = i[value]['value'].split('/')[-1]
 
+            # make sure datetimes are formatted correctly.
+            # the correct format is '+%Y-%m-%dT%H:%M:%SZ', but is sometimes missing the plus??
+            # some difference between RDF and xsd:dateTime that I don't understand
+            for value in {'v', 'qval', 'rval'}:
+                if value in i:
+                    if i[value].get("datatype") == 'http://www.w3.org/2001/XMLSchema#dateTime' and not \
+                            i[value]['value'][0] in '+-':
+                        # if it is a dateTime and doesn't start with plus or minus, add a plus
+                        i[value]['value'] = '+' + i[value]['value']
+
+            # these three ({'v', 'qval', 'rval'}) are values that can be any data type
+            # strip off the URI if they are wikibase-items
             if 'v' in i:
                 if i['v']['type'] == 'uri' and prop_dt == 'wikibase-item':
                     i['v'] = i['v']['value'].split('/')[-1]
@@ -318,18 +341,21 @@ class FastRunContainer(object):
                 if type(i['v']) is not dict:
                     self.rev_lookup[i['v']].add(i['item'])
 
-            # handle ref
+            # handle qualifier value
+            if 'qval' in i:
+                qual_prop_dt = self.get_prop_datatype(prop_nr=i['pq'])
+                if i['qval']['type'] == 'uri' and qual_prop_dt == 'wikibase-item':
+                    i['qval'] = i['qval']['value'].split('/')[-1]
+                else:
+                    i['qval'] = i['qval']['value']
+
+            # handle reference value
             if 'rval' in i:
-                if ('datatype' in i['rval'] and i['rval']['datatype'] == 'http://www.w3.org/2001/XMLSchema#dateTime' and
-                        not (i['rval']['value'].startswith("+") or i['rval']['value'].startswith("-"))):
-                    i['rval']['value'] = '+' + i['rval']['value']
-                if i['rval']['type'] == 'literal':
+                ref_prop_dt = self.get_prop_datatype(prop_nr=i['pr'])
+                if i['rval']['type'] == 'uri' and ref_prop_dt == 'wikibase-item':
+                    i['rval'] = i['rval']['value'].split('/')[-1]
+                else:
                     i['rval'] = i['rval']['value']
-                elif i['rval']['type'] == 'uri':
-                    if 'www.wikidata.org/entity/' in i['rval']['value']:
-                        i['rval'] = i['rval']['value'].split('/')[-1]
-                    else:
-                        i['rval'] = i['rval']['value']
 
     def update_frc_from_query(self, r, prop_nr):
         # r is the output of format_query_results
@@ -469,9 +495,10 @@ class FastRunContainer(object):
                 data[qid].add(r['label']['value'])
         return data
 
-    @staticmethod
-    def get_prop_datatype(prop_nr, engine):
-        item = engine(wd_item_id=prop_nr)
+    @lru_cache(maxsize=100000)
+    def get_prop_datatype(self, prop_nr):
+        item = self.engine(wd_item_id=prop_nr, sparql_endpoint_url=self.sparql_endpoint_url,
+                           mediawiki_api_url=self.mediawiki_api_url)
         return item.entity_metadata['datatype']
 
     def clear(self):
